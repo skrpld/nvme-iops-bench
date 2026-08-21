@@ -28,20 +28,25 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             musl-tools genisoimage libaio-dev linux-libc-dev
 
-      # musl-gcc собирает с -nostdinc и видит только /usr/include/x86_64-linux-musl.
-      # Ни заголовки ядра (linux/*, asm/*, asm-generic/*), ни libaio.h туда не входят:
-      # без первых fio падал на "fatal error: linux/unistd.h", без второго молча
-      # получал "Linux AIO support no".
-      - name: Expose kernel and libaio headers to musl-gcc
+      # musl-gcc собирает с -nostdinc и подменяет пути поиска библиотек своими
+      # (/usr/include/x86_64-linux-musl, /usr/lib/x86_64-linux-musl). Ни заголовки ядра,
+      # ни libaio.h, ни libaio.a туда не входят — отсюда были и "linux/unistd.h not found",
+      # и "Linux AIO support no", и "cannot find -laio".
+      - name: Expose kernel and libaio headers/libs to musl-gcc
+        env:
+          MUSL_LIB: /usr/lib/x86_64-linux-musl
         run: |
           set -x
           sudo ln -sfn /usr/include/linux                "$MUSL_INC/linux"
           sudo ln -sfn /usr/include/asm-generic          "$MUSL_INC/asm-generic"
           sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
           sudo ln -sfn /usr/include/libaio.h             "$MUSL_INC/libaio.h"
+          # Только .a: libaio.so слинкована с glibc и статической сборке не нужна.
+          sudo ln -sfn /usr/lib/x86_64-linux-gnu/libaio.a "$MUSL_LIB/libaio.a"
           test -e "$MUSL_INC/linux/unistd.h"
           test -e "$MUSL_INC/asm/unistd.h"
           test -e "$MUSL_INC/libaio.h"
+          test -e "$MUSL_LIB/libaio.a"
 
       # Тот же тест, что делает configure fio, но с внятной ошибкой:
       # если статическая линковка glibc-собранного libaio.a с musl не проходит,
@@ -52,6 +57,7 @@ jobs:
           #include <libaio.h>
           int main(void) { io_context_t ctx; return io_queue_init(1, &ctx); }
           EOF
+          musl-gcc -print-file-name=libaio.a   # должен вернуть абсолютный путь, а не "libaio.a"
           musl-gcc -static -o /tmp/aiotest /tmp/aiotest.c -laio
           # Важна именно линковка; рантайм-код io_queue_init на раннере не критичен.
           if /tmp/aiotest; then
