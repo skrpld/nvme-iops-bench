@@ -4,10 +4,20 @@ name: Build offline IOPS-bench ISO
 # Ничего не ставится на твою машину — вся сборка идёт на раннере GitHub.
 on:
   workflow_dispatch:
+    inputs:
+      fio_version:
+        description: "Тег fio для сборки"
+        required: false
+        default: "fio-3.36"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Пин конкретного образа: ubuntu-latest может съехать на новый релиз и сломать пути к заголовкам.
+    runs-on: ubuntu-24.04
+    env:
+      FIO_VERSION: ${{ inputs.fio_version || 'fio-3.36' }}
+      MUSL_INC: /usr/include/x86_64-linux-musl
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -15,27 +25,68 @@ jobs:
       - name: Install build deps (на раннере, не локально)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y musl-tools genisoimage
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools genisoimage libaio-dev linux-libc-dev
+
+      # musl-gcc собирает с -nostdinc и видит только /usr/include/x86_64-linux-musl.
+      # Заголовки ядра (linux/*, asm/*, asm-generic/*) туда не входят → fio падал на
+      # "fatal error: linux/unistd.h: No such file or directory".
+      - name: Expose kernel headers to musl-gcc
+        run: |
+          set -x
+          sudo ln -sfn /usr/include/linux                "$MUSL_INC/linux"
+          sudo ln -sfn /usr/include/asm-generic          "$MUSL_INC/asm-generic"
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+          test -e "$MUSL_INC/linux/unistd.h"
+          test -e "$MUSL_INC/asm/unistd.h"
 
       - name: Build static fio
         run: |
-          git clone --depth 1 --branch fio-3.36 https://github.com/axboe/fio.git /tmp/fio
+          git clone --depth 1 --branch "$FIO_VERSION" https://github.com/axboe/fio.git /tmp/fio
           cd /tmp/fio
-          CC=musl-gcc ./configure --build-static
+          # --disable-native: без него configure включает -march=native под CPU раннера,
+          # и бинарь может упасть с SIGILL на офлайн-VM с более старым процессором.
+          CC=musl-gcc ./configure --build-static --disable-native 2>&1 | tee /tmp/fio-configure.log
+
+          # Гейты: без них собирается "рабочий" fio, который падает уже на офлайн-VM.
+          grep -qE '^Static build +yes' /tmp/fio-configure.log \
+            || { echo "::error::fio собран не статически"; exit 1; }
+          grep -qE '^Linux AIO support +yes' /tmp/fio-configure.log \
+            || { echo "::error::libaio не найден — ioengine=libaio будет недоступен на VM"; exit 1; }
+
           make -j"$(nproc)"
-          mkdir -p "$GITHUB_WORKSPACE/bin"
-          cp ./fio "$GITHUB_WORKSPACE/bin/fio"
-          strip "$GITHUB_WORKSPACE/bin/fio"
-          "$GITHUB_WORKSPACE/bin/fio" --version
+
+      - name: Verify binary
+        run: |
+          strip /tmp/fio/fio
+          /tmp/fio/fio --version
+          file /tmp/fio/fio
+          ldd /tmp/fio/fio || true   # для статического бинаря ldd возвращает ненулевой код
+          /tmp/fio/fio --enghelp | tee /tmp/enghelp.txt
+          grep -qw libaio /tmp/enghelp.txt \
+            || { echo "::error::ioengine libaio отсутствует в собранном fio"; exit 1; }
+
+      # Собираем ISO из отдельного staging-каталога, а не из $GITHUB_WORKSPACE:
+      # иначе .git/ и сам .iso попадают внутрь образа (запись в каталог, который читаем).
+      - name: Stage ISO contents
+        run: |
+          STAGE="$RUNNER_TEMP/iso"
+          mkdir -p "$STAGE/bin"
+          cp 02_run_benchmark.sh 03_generate_report.py README.md "$STAGE/"
+          cp /tmp/fio/fio "$STAGE/bin/fio"
+          chmod 755 "$STAGE/bin/fio" "$STAGE/02_run_benchmark.sh" "$STAGE/03_generate_report.py"
+          find "$STAGE" -type f -printf '%M %p\n'
 
       - name: Build ISO
         run: |
-          genisoimage -V "NVMEBENCH" -J -r -o nvme-iops-bench.iso "$GITHUB_WORKSPACE" \
-            -x "$GITHUB_WORKSPACE/nvme-iops-bench.iso" \
-            -x "$GITHUB_WORKSPACE/.git"
+          # -R (полный Rock Ridge), а не -r: сохраняет права, включая бит выполнения.
+          genisoimage -V "NVMEBENCH" -J -R \
+            -o "$RUNNER_TEMP/nvme-iops-bench.iso" "$RUNNER_TEMP/iso"
+          ls -lh "$RUNNER_TEMP/nvme-iops-bench.iso"
 
       - name: Upload ISO as artifact
         uses: actions/upload-artifact@v4
         with:
           name: nvme-iops-bench-iso
-          path: nvme-iops-bench.iso
+          path: ${{ runner.temp }}/nvme-iops-bench.iso
+          if-no-files-found: error
