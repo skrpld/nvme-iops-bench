@@ -1,85 +1,74 @@
 name: Build offline IOPS-bench ISO
 
-# Запуск вручную: вкладка "Actions" в репозитории → "Build offline IOPS-bench ISO" → "Run workflow".
-# Ничего не ставится на твою машину — вся сборка идёт на раннере GitHub.
 on:
   workflow_dispatch:
     inputs:
       fio_version:
-        description: "Тег fio для сборки"
+        description: "fio tag to build"
         required: false
         default: "fio-3.36"
 
 jobs:
   build:
-    # Пин конкретного образа: ubuntu-latest может съехать на новый релиз и сломать пути к заголовкам.
     runs-on: ubuntu-24.04
     env:
       FIO_VERSION: ${{ inputs.fio_version || 'fio-3.36' }}
       MUSL_INC: /usr/include/x86_64-linux-musl
+      MUSL_LIB: /usr/lib/x86_64-linux-musl
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install build deps (на раннере, не локально)
+      - name: Install build deps
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             musl-tools genisoimage libaio-dev linux-libc-dev
 
-      # musl-gcc собирает с -nostdinc и подменяет пути поиска библиотек своими
-      # (/usr/include/x86_64-linux-musl, /usr/lib/x86_64-linux-musl). Ни заголовки ядра,
-      # ни libaio.h, ни libaio.a туда не входят — отсюда были и "linux/unistd.h not found",
-      # и "Linux AIO support no", и "cannot find -laio".
+      # musl-gcc replaces the default include and library search paths instead of
+      # extending them, so kernel headers and libaio are invisible without these links.
       - name: Expose kernel and libaio headers/libs to musl-gcc
-        env:
-          MUSL_LIB: /usr/lib/x86_64-linux-musl
         run: |
           set -x
-          sudo ln -sfn /usr/include/linux                "$MUSL_INC/linux"
-          sudo ln -sfn /usr/include/asm-generic          "$MUSL_INC/asm-generic"
-          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
-          sudo ln -sfn /usr/include/libaio.h             "$MUSL_INC/libaio.h"
-          # Только .a: libaio.so слинкована с glibc и статической сборке не нужна.
+          sudo ln -sfn /usr/include/linux                 "$MUSL_INC/linux"
+          sudo ln -sfn /usr/include/asm-generic           "$MUSL_INC/asm-generic"
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm  "$MUSL_INC/asm"
+          sudo ln -sfn /usr/include/libaio.h              "$MUSL_INC/libaio.h"
           sudo ln -sfn /usr/lib/x86_64-linux-gnu/libaio.a "$MUSL_LIB/libaio.a"
           test -e "$MUSL_INC/linux/unistd.h"
           test -e "$MUSL_INC/asm/unistd.h"
           test -e "$MUSL_INC/libaio.h"
           test -e "$MUSL_LIB/libaio.a"
 
-      # Тот же тест, что делает configure fio, но с внятной ошибкой:
-      # если статическая линковка glibc-собранного libaio.a с musl не проходит,
-      # это видно здесь, а не в виде "Linux AIO support no" на 40 строк ниже.
-      - name: Preflight — musl + libaio static link
+      # Same probe fio's configure runs, but failing here gives a readable error
+      # instead of a silent "Linux AIO support no" further down.
+      - name: Preflight - musl + libaio static link
         run: |
           cat > /tmp/aiotest.c <<'EOF'
           #include <libaio.h>
           int main(void) { io_context_t ctx; return io_queue_init(1, &ctx); }
           EOF
-          musl-gcc -print-file-name=libaio.a   # должен вернуть абсолютный путь, а не "libaio.a"
+          musl-gcc -print-file-name=libaio.a
           musl-gcc -static -o /tmp/aiotest /tmp/aiotest.c -laio
-          # Важна именно линковка; рантайм-код io_queue_init на раннере не критичен.
           if /tmp/aiotest; then
             echo "libaio: link + runtime OK"
           else
-            echo "::warning::libaio слинковался, но io_queue_init вернул $?"
+            echo "::warning::libaio linked, but io_queue_init returned $?"
           fi
 
       - name: Build static fio
         run: |
           git clone --depth 1 --branch "$FIO_VERSION" https://github.com/axboe/fio.git /tmp/fio
           cd /tmp/fio
-          # --disable-native: без него configure включает -march=native под CPU раннера,
-          # и бинарь может упасть с SIGILL на офлайн-VM с более старым процессором.
+          # --disable-native: -march=native would target the runner CPU and may SIGILL
+          # on an older offline VM.
           CC=musl-gcc ./configure --build-static --disable-native 2>&1 | tee /tmp/fio-configure.log
 
-          # Гейты: без них собирается "рабочий" fio, который падает уже на офлайн-VM.
           grep -qE '^Static build +yes' /tmp/fio-configure.log \
-            || { echo "::error::fio собран не статически"; exit 1; }
+            || { echo "::error::fio is not built statically"; exit 1; }
           if ! grep -qE '^Linux AIO support +yes' /tmp/fio-configure.log; then
-            echo "::error::libaio не найден — ioengine=libaio будет недоступен на VM"
-            echo "--- последние 60 строк config.log ---"
+            echo "::error::libaio not detected - ioengine=libaio would be missing on the VM"
             tail -n 60 config.log || true
             exit 1
           fi
@@ -91,13 +80,12 @@ jobs:
           strip /tmp/fio/fio
           /tmp/fio/fio --version
           file /tmp/fio/fio
-          ldd /tmp/fio/fio || true   # для статического бинаря ldd возвращает ненулевой код
+          ldd /tmp/fio/fio || true
           /tmp/fio/fio --enghelp | tee /tmp/enghelp.txt
           grep -qw libaio /tmp/enghelp.txt \
-            || { echo "::error::ioengine libaio отсутствует в собранном fio"; exit 1; }
+            || { echo "::error::ioengine libaio missing from the built fio"; exit 1; }
 
-      # Собираем ISO из отдельного staging-каталога, а не из $GITHUB_WORKSPACE:
-      # иначе .git/ и сам .iso попадают внутрь образа (запись в каталог, который читаем).
+      # Staged separately so that .git/ and the ISO itself stay out of the image.
       - name: Stage ISO contents
         run: |
           STAGE="$RUNNER_TEMP/iso"
@@ -109,7 +97,7 @@ jobs:
 
       - name: Build ISO
         run: |
-          # -R (полный Rock Ridge), а не -r: сохраняет права, включая бит выполнения.
+          # -R (full Rock Ridge) preserves permissions, including the executable bit.
           genisoimage -V "NVMEBENCH" -J -R \
             -o "$RUNNER_TEMP/nvme-iops-bench.iso" "$RUNNER_TEMP/iso"
           ls -lh "$RUNNER_TEMP/nvme-iops-bench.iso"

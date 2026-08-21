@@ -1,43 +1,40 @@
 #!/usr/bin/env bash
-# Серия fio-тестов для проверки биллинга IOPS на NVMe-диске облачного сервиса.
+# fio benchmark suite for verifying a cloud provider's NVMe IOPS billing claims.
 #
-# Использование:
+# Usage:
 #   ./02_run_benchmark.sh <TARGET> [SIZE] [OUTDIR]
 #
-#   TARGET  — путь к тестовому файлу ИЛИ сырое устройство (/dev/nvme1n1).
-#             ⚠️ Если TARGET — блочное устройство, ВСЕ ДАННЫЕ НА НЁМ БУДУТ УНИЧТОЖЕНЫ.
-#             Используй отдельный/пустой диск, не системный.
-#   SIZE    — размер тестового файла, если TARGET — файл (по умолчанию 4G)
-#   OUTDIR  — куда складывать json-результаты
-#             (по умолчанию /var/tmp/nvme-iops-bench/<timestamp> — CD смонтирован read-only)
+#   TARGET  path to a test file, or a raw block device (/dev/nvme1n1).
+#           A block device is overwritten in full. Use an empty, non-system disk.
+#   SIZE    test file size when TARGET is a file (default 4G)
+#   OUTDIR  where the json results go (default /var/tmp/nvme-iops-bench/<timestamp>)
 #
-# Переменные окружения:
-#   RUNTIME=30    секунд на каждый под-тест
-#   RAMP_TIME=5   секунд прогрева, не попадающих в статистику
-#   IOENGINE=     принудительный ioengine (по умолчанию libaio → io_uring → psync)
+# Environment:
+#   RUNTIME=30    seconds per sub-test
+#   RAMP_TIME=5   warm-up seconds excluded from the statistics
+#   IOENGINE=     force an ioengine (default: libaio -> io_uring -> psync)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Сначала ищем статический fio рядом со скриптом (офлайн-бандл), иначе — системный.
 if [[ -x "$SCRIPT_DIR/bin/fio" ]]; then
   FIO="$SCRIPT_DIR/bin/fio"
 elif command -v fio &>/dev/null; then
   FIO="fio"
 else
-  echo "❌ fio не найден ни в $SCRIPT_DIR/bin/fio, ни в PATH." >&2
-  echo "   Пересобери ISO через GitHub Actions (workflow 'Build offline IOPS-bench ISO')." >&2
+  echo "fio not found in $SCRIPT_DIR/bin/fio or in PATH." >&2
+  echo "Rebuild the ISO via the 'Build offline IOPS-bench ISO' workflow." >&2
   exit 1
 fi
-echo "Используется fio: $FIO ($("$FIO" --version))"
+echo "fio: $FIO ($("$FIO" --version))"
 
-# Выбор ioengine по факту доступности: в статической сборке движок может отсутствовать,
-# а старое ядро на VM может не поддерживать io_uring. Жёсткий --ioengine=libaio ронял прогон.
+# An engine may be missing from the static build, and io_uring needs kernel >= 5.1,
+# so pick what is actually available rather than assuming libaio.
 select_engine() {
   local avail candidate
   avail="$("$FIO" --enghelp 2>/dev/null || true)"
   if [[ -n "${IOENGINE:-}" ]]; then
     if grep -qw -- "$IOENGINE" <<<"$avail"; then echo "$IOENGINE"; return; fi
-    echo "❌ ioengine '$IOENGINE' недоступен в этой сборке fio." >&2
+    echo "ioengine '$IOENGINE' is not available in this fio build." >&2
     exit 1
   fi
   for candidate in libaio io_uring psync; do
@@ -48,10 +45,10 @@ select_engine() {
 ENGINE="$(select_engine)"
 echo "ioengine: $ENGINE"
 if [[ "$ENGINE" == "psync" || "$ENGINE" == "sync" ]]; then
-  echo "⚠️  Синхронный движок игнорирует iodepth — результаты при QD>1 будут занижены." >&2
+  echo "WARNING: a synchronous engine ignores iodepth; QD>1 results will be understated." >&2
 fi
 
-TARGET="${1:?Укажи TARGET: путь к файлу или блочное устройство}"
+TARGET="${1:?TARGET required: a file path or a block device}"
 SIZE="${2:-4G}"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="${3:-/var/tmp/nvme-iops-bench/$TS}"
@@ -60,9 +57,9 @@ mkdir -p "$OUTDIR"
 IS_DEVICE=0
 if [[ -b "$TARGET" ]]; then
   IS_DEVICE=1
-  echo "⚠️  TARGET — блочное устройство ($TARGET). Данные на нём будут уничтожены."
-  read -rp "Продолжить? (yes/no): " CONFIRM
-  [[ "$CONFIRM" == "yes" ]] || { echo "Отменено."; exit 1; }
+  echo "WARNING: $TARGET is a block device. All data on it will be destroyed."
+  read -rp "Continue? (yes/no): " CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || { echo "Aborted."; exit 1; }
 fi
 
 RUNTIME="${RUNTIME:-30}"
@@ -76,32 +73,25 @@ fi
 
 run_job () {
   local name="$1"; shift
-  echo "▶ $name"
-  # --output, а не '>': с --output-format=json fio всё равно печатает в stdout
-  # служебные строки ("Laying out IO file...") и ломает JSON.
+  echo "> $name"
+  # --output rather than a shell redirect: fio still prints progress lines to
+  # stdout under --output-format=json, which would corrupt the file.
   "$FIO" "${COMMON[@]}" --runtime="$RUNTIME" --name="$name" \
     --output="$OUTDIR/${name}.json" "$@"
 }
 
-# 1. Random Read IOPS, 4k блок, разные глубины очереди
 for qd in 1 8 32 64; do
   run_job "randread_4k_qd${qd}" --rw=randread --bs=4k --iodepth="$qd" --numjobs=1
 done
 
-# 2. Random Write IOPS, 4k блок, разные глубины очереди
 for qd in 1 8 32 64; do
   run_job "randwrite_4k_qd${qd}" --rw=randwrite --bs=4k --iodepth="$qd" --numjobs=1
 done
 
-# 3. Смешанная нагрузка 70/30 read/write (типичный профиль биллинга IOPS)
 run_job "randrw_70r30w_4k_qd32" --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --numjobs=4
-
-# 4. Latency-тест: QD=1, показывает "чистую" задержку диска
 run_job "latency_4k_qd1" --rw=randread --bs=4k --iodepth=1 --numjobs=1
-
-# 5. Sequential throughput (для сравнения — обычно не то, что биллится по IOPS)
 run_job "seqread_128k" --rw=read --bs=128k --iodepth=32 --numjobs=1
 run_job "seqwrite_128k" --rw=write --bs=128k --iodepth=32 --numjobs=1
 
-echo "✅ Готово. JSON-результаты: $OUTDIR"
+echo "Done. JSON results: $OUTDIR"
 echo "$OUTDIR" > /tmp/nvme_bench_last_outdir
