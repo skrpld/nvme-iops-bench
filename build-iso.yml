@@ -1,0 +1,41 @@
+name: Build offline IOPS-bench ISO
+
+# Запуск вручную: вкладка "Actions" в репозитории → "Build offline IOPS-bench ISO" → "Run workflow".
+# Ничего не ставится на твою машину — вся сборка идёт на раннере GitHub.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install build deps (на раннере, не локально)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y musl-tools genisoimage
+
+      - name: Build static fio
+        run: |
+          git clone --depth 1 --branch fio-3.36 https://github.com/axboe/fio.git /tmp/fio
+          cd /tmp/fio
+          CC=musl-gcc ./configure --build-static
+          make -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          cp ./fio "$GITHUB_WORKSPACE/bin/fio"
+          strip "$GITHUB_WORKSPACE/bin/fio"
+          "$GITHUB_WORKSPACE/bin/fio" --version
+
+      - name: Build ISO
+        run: |
+          genisoimage -V "NVMEBENCH" -J -r -o nvme-iops-bench.iso "$GITHUB_WORKSPACE" \
+            -x "$GITHUB_WORKSPACE/nvme-iops-bench.iso" \
+            -x "$GITHUB_WORKSPACE/.git"
+
+      - name: Upload ISO as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvme-iops-bench-iso
+          path: nvme-iops-bench.iso
