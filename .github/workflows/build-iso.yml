@@ -29,16 +29,36 @@ jobs:
             musl-tools genisoimage libaio-dev linux-libc-dev
 
       # musl-gcc собирает с -nostdinc и видит только /usr/include/x86_64-linux-musl.
-      # Заголовки ядра (linux/*, asm/*, asm-generic/*) туда не входят → fio падал на
-      # "fatal error: linux/unistd.h: No such file or directory".
-      - name: Expose kernel headers to musl-gcc
+      # Ни заголовки ядра (linux/*, asm/*, asm-generic/*), ни libaio.h туда не входят:
+      # без первых fio падал на "fatal error: linux/unistd.h", без второго молча
+      # получал "Linux AIO support no".
+      - name: Expose kernel and libaio headers to musl-gcc
         run: |
           set -x
           sudo ln -sfn /usr/include/linux                "$MUSL_INC/linux"
           sudo ln -sfn /usr/include/asm-generic          "$MUSL_INC/asm-generic"
           sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+          sudo ln -sfn /usr/include/libaio.h             "$MUSL_INC/libaio.h"
           test -e "$MUSL_INC/linux/unistd.h"
           test -e "$MUSL_INC/asm/unistd.h"
+          test -e "$MUSL_INC/libaio.h"
+
+      # Тот же тест, что делает configure fio, но с внятной ошибкой:
+      # если статическая линковка glibc-собранного libaio.a с musl не проходит,
+      # это видно здесь, а не в виде "Linux AIO support no" на 40 строк ниже.
+      - name: Preflight — musl + libaio static link
+        run: |
+          cat > /tmp/aiotest.c <<'EOF'
+          #include <libaio.h>
+          int main(void) { io_context_t ctx; return io_queue_init(1, &ctx); }
+          EOF
+          musl-gcc -static -o /tmp/aiotest /tmp/aiotest.c -laio
+          # Важна именно линковка; рантайм-код io_queue_init на раннере не критичен.
+          if /tmp/aiotest; then
+            echo "libaio: link + runtime OK"
+          else
+            echo "::warning::libaio слинковался, но io_queue_init вернул $?"
+          fi
 
       - name: Build static fio
         run: |
@@ -51,8 +71,12 @@ jobs:
           # Гейты: без них собирается "рабочий" fio, который падает уже на офлайн-VM.
           grep -qE '^Static build +yes' /tmp/fio-configure.log \
             || { echo "::error::fio собран не статически"; exit 1; }
-          grep -qE '^Linux AIO support +yes' /tmp/fio-configure.log \
-            || { echo "::error::libaio не найден — ioengine=libaio будет недоступен на VM"; exit 1; }
+          if ! grep -qE '^Linux AIO support +yes' /tmp/fio-configure.log; then
+            echo "::error::libaio не найден — ioengine=libaio будет недоступен на VM"
+            echo "--- последние 60 строк config.log ---"
+            tail -n 60 config.log || true
+            exit 1
+          fi
 
           make -j"$(nproc)"
 
