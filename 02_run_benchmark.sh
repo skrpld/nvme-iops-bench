@@ -4,11 +4,17 @@
 # Использование:
 #   ./02_run_benchmark.sh <TARGET> [SIZE] [OUTDIR]
 #
-#   TARGET  — путь к тестовому файлу (по умолчанию режим) ИЛИ сырое устройство (/dev/nvme1n1).
+#   TARGET  — путь к тестовому файлу ИЛИ сырое устройство (/dev/nvme1n1).
 #             ⚠️ Если TARGET — блочное устройство, ВСЕ ДАННЫЕ НА НЁМ БУДУТ УНИЧТОЖЕНЫ.
 #             Используй отдельный/пустой диск, не системный.
 #   SIZE    — размер тестового файла, если TARGET — файл (по умолчанию 4G)
-#   OUTDIR  — куда складывать json-результаты (по умолчанию ./results/<timestamp>)
+#   OUTDIR  — куда складывать json-результаты
+#             (по умолчанию /var/tmp/nvme-iops-bench/<timestamp> — CD смонтирован read-only)
+#
+# Переменные окружения:
+#   RUNTIME=30    секунд на каждый под-тест
+#   RAMP_TIME=5   секунд прогрева, не попадающих в статистику
+#   IOENGINE=     принудительный ioengine (по умолчанию libaio → io_uring → psync)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,15 +25,36 @@ elif command -v fio &>/dev/null; then
   FIO="fio"
 else
   echo "❌ fio не найден ни в $SCRIPT_DIR/bin/fio, ни в PATH." >&2
-  echo "   Собери офлайн-бандл через 00_build_static_fio.sh на машине с интернетом." >&2
+  echo "   Пересобери ISO через GitHub Actions (workflow 'Build offline IOPS-bench ISO')." >&2
   exit 1
 fi
 echo "Используется fio: $FIO ($("$FIO" --version))"
 
+# Выбор ioengine по факту доступности: в статической сборке движок может отсутствовать,
+# а старое ядро на VM может не поддерживать io_uring. Жёсткий --ioengine=libaio ронял прогон.
+select_engine() {
+  local avail candidate
+  avail="$("$FIO" --enghelp 2>/dev/null || true)"
+  if [[ -n "${IOENGINE:-}" ]]; then
+    if grep -qw -- "$IOENGINE" <<<"$avail"; then echo "$IOENGINE"; return; fi
+    echo "❌ ioengine '$IOENGINE' недоступен в этой сборке fio." >&2
+    exit 1
+  fi
+  for candidate in libaio io_uring psync; do
+    if grep -qw -- "$candidate" <<<"$avail"; then echo "$candidate"; return; fi
+  done
+  echo "sync"
+}
+ENGINE="$(select_engine)"
+echo "ioengine: $ENGINE"
+if [[ "$ENGINE" == "psync" || "$ENGINE" == "sync" ]]; then
+  echo "⚠️  Синхронный движок игнорирует iodepth — результаты при QD>1 будут занижены." >&2
+fi
+
 TARGET="${1:?Укажи TARGET: путь к файлу или блочное устройство}"
 SIZE="${2:-4G}"
 TS="$(date +%Y%m%d_%H%M%S)"
-OUTDIR="${3:-./results/$TS}"
+OUTDIR="${3:-/var/tmp/nvme-iops-bench/$TS}"
 mkdir -p "$OUTDIR"
 
 IS_DEVICE=0
@@ -38,17 +65,22 @@ if [[ -b "$TARGET" ]]; then
   [[ "$CONFIRM" == "yes" ]] || { echo "Отменено."; exit 1; }
 fi
 
-COMMON=(--filename="$TARGET" --direct=1 --ioengine=libaio --group_reporting
-        --output-format=json --time_based)
-[[ $IS_DEVICE -eq 0 ]] && COMMON+=(--size="$SIZE")
+RUNTIME="${RUNTIME:-30}"
+RAMP_TIME="${RAMP_TIME:-5}"
 
-RUNTIME="${RUNTIME:-30}"   # секунд на тест, override через env RUNTIME=60
+COMMON=(--filename="$TARGET" --direct=1 --ioengine="$ENGINE" --group_reporting
+        --output-format=json --time_based --ramp_time="$RAMP_TIME")
+if [[ $IS_DEVICE -eq 0 ]]; then
+  COMMON+=(--size="$SIZE")
+fi
 
 run_job () {
   local name="$1"; shift
   echo "▶ $name"
-  "$FIO" "${COMMON[@]}" --runtime="$RUNTIME" --name="$name" "$@" \
-    > "$OUTDIR/${name}.json"
+  # --output, а не '>': с --output-format=json fio всё равно печатает в stdout
+  # служебные строки ("Laying out IO file...") и ломает JSON.
+  "$FIO" "${COMMON[@]}" --runtime="$RUNTIME" --name="$name" \
+    --output="$OUTDIR/${name}.json" "$@"
 }
 
 # 1. Random Read IOPS, 4k блок, разные глубины очереди
@@ -64,7 +96,7 @@ done
 # 3. Смешанная нагрузка 70/30 read/write (типичный профиль биллинга IOPS)
 run_job "randrw_70r30w_4k_qd32" --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --numjobs=4
 
-# 4. Latency-тест: QD=1, синхронный, показывает "чистую" задержку диска
+# 4. Latency-тест: QD=1, показывает "чистую" задержку диска
 run_job "latency_4k_qd1" --rw=randread --bs=4k --iodepth=1 --numjobs=1
 
 # 5. Sequential throughput (для сравнения — обычно не то, что биллится по IOPS)
